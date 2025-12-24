@@ -1,0 +1,8 @@
+{
+  "name": "HealBites AI Assistant",
+  "description": "A sleek culinary companion that identifies fridge ingredients from photos, suggests tailored recipes, and provides a hands-free step-by-step cooking experience with voice support.",
+  "requestFramePermissions": [
+    "camera",
+    "geolocation"
+  ]
+}
