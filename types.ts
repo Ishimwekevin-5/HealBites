@@ -1,4 +1,6 @@
 
+import { User } from '@supabase/supabase-js';
+
 export enum Difficulty {
   EASY = 'Easy',
   MEDIUM = 'Medium',
@@ -37,7 +39,8 @@ export interface Recipe {
 }
 
 export interface AppState {
-  view: 'home' | 'scan' | 'recipe-list' | 'cooking-mode' | 'shopping-list';
+  view: 'auth' | 'home' | 'scan' | 'recipe-list' | 'cooking-mode' | 'shopping-list';
+  user: User | null;
   ingredientsFound: string[];
   selectedRecipe: Recipe | null;
   shoppingList: ShoppingListItem[];
@@ -45,6 +48,7 @@ export interface AppState {
   ageGroup: 'Adults' | 'Children' | 'Mixed';
   allergies: string[];
   isLoading: boolean;
+  isInitialLoading: boolean;
   balance: number;
   estimatedTotal: number;
   nearbyStores: NearbyStore[];

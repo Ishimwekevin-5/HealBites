@@ -5,12 +5,14 @@ import { Sidebar } from './components/Sidebar';
 import { CameraInput } from './components/CameraInput';
 import { RecipeCard } from './components/RecipeCard';
 import { CookingMode } from './components/CookingMode';
+import { Auth } from './components/Auth';
 import { analyzeFridgeImage, findNearbySupermarkets, estimateTotalCost } from './services/geminiService';
 import { supabase } from './lib/supabase';
 
 const App: React.FC = () => {
   const [state, setState] = useState<AppState>({
-    view: 'home',
+    view: 'auth',
+    user: null,
     ingredientsFound: [],
     selectedRecipe: null,
     shoppingList: [],
@@ -18,6 +20,7 @@ const App: React.FC = () => {
     ageGroup: 'Adults',
     allergies: [],
     isLoading: false,
+    isInitialLoading: true,
     balance: 50.00,
     estimatedTotal: 0,
     nearbyStores: []
@@ -25,41 +28,104 @@ const App: React.FC = () => {
 
   const [recipes, setRecipes] = useState<Recipe[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [dbStatus, setDbStatus] = useState<'connected' | 'local'>('local');
   const [isLocating, setIsLocating] = useState(false);
 
+  // 1. Session & Auth Listener - Improved for Caching/Persistence
   useEffect(() => {
-    initData();
+    // Immediate session check
+    const checkSession = async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (session) {
+        setState(prev => ({ 
+          ...prev, 
+          user: session.user, 
+          view: 'home',
+          isInitialLoading: false 
+        }));
+        await fetchUserData(session.user.id);
+      } else {
+        setState(prev => ({ ...prev, isInitialLoading: false }));
+      }
+    };
+
+    checkSession();
+
+    // Listen for auth state changes (Sign in, Sign up, Sign out)
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (session) {
+        setState(prev => ({ 
+          ...prev, 
+          user: session.user, 
+          view: 'home',
+          isInitialLoading: false
+        }));
+        fetchUserData(session.user.id);
+      } else {
+        setState(prev => ({ 
+          ...prev, 
+          user: null, 
+          view: 'auth',
+          isInitialLoading: false
+        }));
+      }
+    });
+
+    return () => subscription.unsubscribe();
   }, []);
+
+  // 2. Data Fetching Logic
+  const fetchUserData = async (userId: string) => {
+    // Fetch Profile
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('servings, age_group, allergies, balance')
+      .eq('id', userId)
+      .single();
+
+    if (profile) {
+      setState(prev => ({
+        ...prev,
+        servings: profile.servings,
+        ageGroup: profile.age_group,
+        allergies: profile.allergies,
+        balance: profile.balance
+      }));
+    }
+
+    // Fetch Shopping List
+    const { data: list } = await supabase
+      .from('shopping_list')
+      .select('name, amount')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: true });
+
+    if (list) {
+      setState(prev => ({ ...prev, shoppingList: list }));
+    }
+  };
+
+  // 3. Persistent Sync Helpers
+  useEffect(() => {
+    if (state.user) {
+      syncProfile();
+    }
+  }, [state.servings, state.ageGroup, state.allergies, state.balance]);
+
+  const syncProfile = async () => {
+    if (!state.user) return;
+    await supabase.from('profiles').upsert({
+      id: state.user.id,
+      servings: state.servings,
+      age_group: state.ageGroup,
+      allergies: state.allergies,
+      balance: state.balance,
+      updated_at: new Date().toISOString()
+    });
+  };
 
   useEffect(() => {
     updateCostEstimation();
   }, [state.shoppingList]);
-
-  const initData = async () => {
-    try {
-      const { data, error: sbError } = await supabase
-        .from('shopping_list')
-        .select('name, amount')
-        .order('created_at', { ascending: true });
-
-      if (sbError) {
-        const isMissing = sbError.code === '42P01' || sbError.message.includes('schema cache');
-        if (isMissing) {
-          loadLocalData();
-          setDbStatus('local');
-        } else {
-          throw sbError;
-        }
-      } else if (data) {
-        setState(prev => ({ ...prev, shoppingList: data as ShoppingListItem[] }));
-        setDbStatus('connected');
-      }
-    } catch (err) {
-      loadLocalData();
-      setDbStatus('local');
-    }
-  };
 
   const updateCostEstimation = async () => {
     if (state.shoppingList.length === 0) {
@@ -68,21 +134,6 @@ const App: React.FC = () => {
     }
     const cost = await estimateTotalCost(state.shoppingList);
     setState(prev => ({ ...prev, estimatedTotal: cost }));
-  };
-
-  const loadLocalData = () => {
-    const saved = localStorage.getItem('healbites_shopping_list_v2');
-    if (saved) {
-      try {
-        setState(prev => ({ ...prev, shoppingList: JSON.parse(saved) }));
-      } catch (e) {
-        console.error('Failed to parse local storage');
-      }
-    }
-  };
-
-  const saveLocalData = (list: ShoppingListItem[]) => {
-    localStorage.setItem('healbites_shopping_list_v2', JSON.stringify(list));
   };
 
   const handleNearbyStores = () => {
@@ -104,64 +155,56 @@ const App: React.FC = () => {
   };
 
   const addToShoppingList = async (item: ShoppingListItem) => {
+    if (!state.user) return;
     const exists = state.shoppingList.find(i => i.name.toLowerCase() === item.name.toLowerCase());
     if (!exists) {
       const newList = [...state.shoppingList, item];
       setState(prev => ({ ...prev, shoppingList: newList }));
-      saveLocalData(newList);
-      if (dbStatus === 'connected') {
-        try {
-          await supabase.from('shopping_list').insert([{ name: item.name, amount: item.amount }]);
-        } catch (e) {
-          console.warn("Supabase insertion failed - falling back to local");
-        }
-      }
+      await supabase.from('shopping_list').insert([{ 
+        user_id: state.user.id,
+        name: item.name, 
+        amount: item.amount 
+      }]);
     }
   };
 
   const addMultipleToShoppingList = async (items: ShoppingListItem[]) => {
+    if (!state.user) return;
     const currentNames = state.shoppingList.map(i => i.name.toLowerCase());
     const newItems = items.filter(i => !currentNames.includes(i.name.toLowerCase()));
     if (newItems.length > 0) {
       const newList = [...state.shoppingList, ...newItems];
       setState(prev => ({ ...prev, shoppingList: newList }));
-      saveLocalData(newList);
-      if (dbStatus === 'connected') {
-        try {
-          await supabase.from('shopping_list').insert(newItems.map(i => ({ name: i.name, amount: i.amount })));
-        } catch (e) {
-          console.warn("Supabase bulk insert failed - falling back to local");
-        }
-      }
+      await supabase.from('shopping_list').insert(
+        newItems.map(i => ({ 
+          user_id: state.user!.id,
+          name: i.name, 
+          amount: i.amount 
+        }))
+      );
     }
   };
 
   const updateItemAmount = async (name: string, newAmount: string) => {
+    if (!state.user) return;
     const newList = state.shoppingList.map(item => 
       item.name === name ? { ...item, amount: newAmount } : item
     );
     setState(prev => ({ ...prev, shoppingList: newList }));
-    saveLocalData(newList);
-    if (dbStatus === 'connected') {
-      try {
-        await supabase.from('shopping_list').update({ amount: newAmount }).eq('name', name);
-      } catch (e) {
-        console.warn("Supabase update failed");
-      }
-    }
+    await supabase.from('shopping_list')
+      .update({ amount: newAmount })
+      .eq('user_id', state.user.id)
+      .eq('name', name);
   };
 
   const removeFromShoppingList = async (name: string) => {
+    if (!state.user) return;
     const newList = state.shoppingList.filter(i => i.name !== name);
     setState(prev => ({ ...prev, shoppingList: newList }));
-    saveLocalData(newList);
-    if (dbStatus === 'connected') {
-      try {
-        await supabase.from('shopping_list').delete().eq('name', name);
-      } catch (e) {
-        console.warn("Supabase delete failed");
-      }
-    }
+    await supabase.from('shopping_list')
+      .delete()
+      .eq('user_id', state.user.id)
+      .eq('name', name);
   };
 
   const handleImageCapture = async (base64: string) => {
@@ -187,7 +230,31 @@ const App: React.FC = () => {
     }
   };
 
+  // Initial Loading Splash Screen
+  if (state.isInitialLoading) {
+    return (
+      <div className="min-h-screen bg-white flex flex-col items-center justify-center p-6">
+        <div className="relative">
+          <div className="w-24 h-24 bg-black rounded-[2.5rem] flex items-center justify-center text-white shadow-2xl animate-float">
+            <i className="fas fa-utensils text-3xl"></i>
+          </div>
+          <div className="absolute -inset-4 border-2 border-black/5 rounded-[3rem] animate-ping opacity-20"></div>
+        </div>
+        <div className="mt-12 text-center">
+          <h1 className="text-2xl font-black text-slate-900 tracking-tight mb-2">HealBites</h1>
+          <div className="flex gap-1 justify-center">
+            <div className="w-1.5 h-1.5 bg-black rounded-full animate-bounce [animation-delay:-0.3s]"></div>
+            <div className="w-1.5 h-1.5 bg-black rounded-full animate-bounce [animation-delay:-0.15s]"></div>
+            <div className="w-1.5 h-1.5 bg-black rounded-full animate-bounce"></div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   const renderContent = () => {
+    if (state.view === 'auth') return <Auth />;
+
     switch (state.view) {
       case 'home':
         return (
@@ -318,10 +385,16 @@ const App: React.FC = () => {
                 <p className="text-slate-500 font-medium">Intelligent budget tracking & inventory procurement.</p>
               </div>
               <div className="flex gap-3">
-                <span className={`px-4 py-2 rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-sm ${dbStatus === 'connected' ? 'bg-slate-50 text-slate-900 border border-slate-200' : 'bg-slate-900 text-white'}`}>
-                  <i className={`fas ${dbStatus === 'connected' ? 'fa-cloud' : 'fa-database'} mr-2`}></i>
-                  {dbStatus === 'connected' ? 'Cloud Synced' : 'Offline Mode'}
+                <span className={`px-4 py-2 rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-sm bg-slate-900 text-white`}>
+                  <i className={`fas fa-cloud-check mr-2`}></i>
+                  Cloud Synced
                 </span>
+                <button 
+                  onClick={() => supabase.auth.signOut()}
+                  className="px-4 py-2 bg-slate-50 text-slate-400 rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-rose-50 hover:text-rose-600 transition-all border border-slate-100"
+                >
+                  Sign Out
+                </button>
               </div>
             </div>
 
@@ -380,7 +453,7 @@ const App: React.FC = () => {
                 </div>
               </div>
 
-              {/* Enhanced Items List with Editable Quantities */}
+              {/* Items List */}
               <div className="lg:col-span-2 bg-white rounded-[3rem] border border-slate-200 p-10 shadow-sm flex flex-col group/list overflow-hidden relative">
                 <div className="flex items-center justify-between mb-10">
                   <h4 className="text-2xl font-black text-slate-900 tracking-tight">Line Items</h4>
@@ -502,36 +575,39 @@ const App: React.FC = () => {
 
   return (
     <div className="flex min-h-screen bg-white">
-      <Sidebar 
-        currentView={state.view} 
-        servings={state.servings} 
-        setServings={(count) => setState(p => ({ ...p, servings: count }))} 
-        ageGroup={state.ageGroup}
-        setAgeGroup={(age) => setState(p => ({ ...p, ageGroup: age }))}
-        allergies={state.allergies}
-        setAllergies={(als) => setState(p => ({ ...p, allergies: als }))}
-        onNavigate={(v) => setState(p => ({ ...p, view: v }))} 
-      />
+      {state.view !== 'auth' && (
+        <Sidebar 
+          currentView={state.view} 
+          servings={state.servings} 
+          setServings={(count) => setState(p => ({ ...p, servings: count }))} 
+          ageGroup={state.ageGroup}
+          setAgeGroup={(age) => setState(p => ({ ...p, ageGroup: age }))}
+          allergies={state.allergies}
+          setAllergies={(als) => setState(p => ({ ...p, allergies: als }))}
+          onNavigate={(v) => setState(p => ({ ...p, view: v }))} 
+        />
+      )}
       <main className="flex-1 pb-24 md:pb-0 overflow-x-hidden bg-white min-h-screen">
         {renderContent()}
       </main>
       
-      {/* Mobile Navigation */}
-      <div className="md:hidden fixed bottom-0 left-0 right-0 bg-white/80 backdrop-blur-xl border-t border-slate-100 px-6 py-4 flex justify-around items-center z-[150] shadow-2xl">
-         {[
-           { id: 'home', icon: 'fa-house' },
-           { id: 'scan', icon: 'fa-camera' },
-           { id: 'shopping-list', icon: 'fa-cart-shopping' }
-         ].map(item => (
-           <button 
-             key={item.id}
-             onClick={() => setState(p => ({ ...p, view: item.id as any }))}
-             className={`w-12 h-12 rounded-2xl flex items-center justify-center transition-all ${state.view === item.id ? 'bg-black text-white shadow-lg' : 'text-slate-400'}`}
-           >
-             <i className={`fas ${item.icon}`}></i>
-           </button>
-         ))}
-      </div>
+      {state.view !== 'auth' && (
+        <div className="md:hidden fixed bottom-0 left-0 right-0 bg-white/80 backdrop-blur-xl border-t border-slate-100 px-6 py-4 flex justify-around items-center z-[150] shadow-2xl">
+           {[
+             { id: 'home', icon: 'fa-house' },
+             { id: 'scan', icon: 'fa-camera' },
+             { id: 'shopping-list', icon: 'fa-cart-shopping' }
+           ].map(item => (
+             <button 
+               key={item.id}
+               onClick={() => setState(p => ({ ...p, view: item.id as any }))}
+               className={`w-12 h-12 rounded-2xl flex items-center justify-center transition-all ${state.view === item.id ? 'bg-black text-white shadow-lg' : 'text-slate-400'}`}
+             >
+               <i className={`fas ${item.icon}`}></i>
+             </button>
+           ))}
+        </div>
+      )}
 
       {state.view === 'cooking-mode' && state.selectedRecipe && (
         <CookingMode 
